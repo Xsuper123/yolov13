@@ -14,6 +14,7 @@ from tarfile import is_tarfile
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+import torch
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.utils import (
@@ -35,7 +36,7 @@ from ultralytics.utils.downloads import download, safe_download, unzip_file
 from ultralytics.utils.ops import segments2boxes
 
 HELP_URL = "See https://docs.ultralytics.com/datasets for dataset formatting guidance."
-IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm", "heic"}  # image suffixes
+IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm", "heic", "pt"}  # image suffixes
 VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ts", "wmv", "webm"}  # video suffixes
 PIN_MEMORY = str(os.getenv("PIN_MEMORY", True)).lower() == "true"  # global pin_memory for dataloaders
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
@@ -68,25 +69,54 @@ def exif_size(img: Image.Image):
             pass
     return s
 
+def _pt_shape(pt_file):
+    """Load .pt data and return image-like shape as (h, w)."""
+    x = torch.load(pt_file, map_location="cpu")
+    t = x if isinstance(x, torch.Tensor) else None
+    if t is None and isinstance(x, dict):
+        for v in x.values():
+            if isinstance(v, torch.Tensor):
+                t = v
+                break
+    if t is None:
+        raise TypeError(f"Unsupported .pt payload type: {type(x)}")
 
+    # Supported: CHW or HWC, with optional leading batch dim.
+    s = tuple(t.shape)
+    if len(s) == 4:
+        s = s[1:]
+    if len(s) != 3:
+        raise ValueError(f"Expected 3D tensor for image data, got shape={tuple(t.shape)}")
+
+ # Fixed CHW
+    c, h, w = int(s[0]), int(s[1]), int(s[2])
+    if c != 32:
+        raise ValueError(f"Expected 32 channels, got {c} for {pt_file}")
+    return h, w 
+    
 def verify_image(args):
     """Verify one image."""
     (im_file, cls), prefix = args
     # Number (found, corrupt), message
     nf, nc, msg = 0, 0, ""
     try:
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
-        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
-            with open(im_file, "rb") as f:
-                f.seek(-2, 2)
-                if f.read() != b"\xff\xd9":  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
-                    msg = f"{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved"
+        suffix = Path(im_file).suffix.lower().lstrip(".")
+        if suffix == "pt": # load pt file 1st 
+            shape = _pt_shape(im_file)  # hw
+            assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+        else:
+            im = Image.open(im_file) #load regular jpg/png image 
+            im.verify()  # PIL verify
+            shape = exif_size(im)  # image size
+            shape = (shape[1], shape[0])  # hw
+            assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+            assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
+            if im.format.lower() in {"jpg", "jpeg"}:
+                with open(im_file, "rb") as f:
+                    f.seek(-2, 2)
+                    if f.read() != b"\xff\xd9":  # corrupt JPEG
+                        ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+                        msg = f"{prefix}WARNING ?????? {im_file}: corrupt JPEG restored and saved"
         nf = 1
     except Exception as e:
         nc = 1
@@ -101,6 +131,11 @@ def verify_image_label(args):
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
         # Verify images
+        suffix = Path(im_file).suffix.lower().lstrip(".")
+        if suffix == "pt": #also add branch to add pt file 
+            shape = _pt_shape(im_file)  # hw
+            assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+        else: 
         im = Image.open(im_file)
         im.verify()  # PIL verify
         shape = exif_size(im)  # image size

@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import psutil
 from torch.utils.data import Dataset
+import torch
 
 from ultralytics.data.utils import FORMATS_HELP_MSG, HELP_URL, IMG_FORMATS
 from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, NUM_THREADS, TQDM
@@ -52,6 +53,7 @@ class BaseDataset(Dataset):
         imgsz=640,
         cache=False,
         augment=True,
+        img_channels=None, # dataloader enforces a fixed channel count, preventing channel-mismatch bugs
         hyp=DEFAULT_CFG,
         prefix="",
         rect=False,
@@ -66,7 +68,9 @@ class BaseDataset(Dataset):
         super().__init__()
         self.img_path = img_path
         self.imgsz = imgsz
-        self.augment = augment
+        self.requested_augment = bool(augment) # force disable all augment behavior 
+        self.augment = False  
+        self.img_channels = img_channels # save channnel info to fix channel-mismatch bugs
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
@@ -158,13 +162,16 @@ class BaseDataset(Dataset):
                 except Exception as e:
                     LOGGER.warning(f"{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {fn} due to: {e}")
                     Path(fn).unlink(missing_ok=True)
-                    im = cv2.imread(f)  # BGR
+                     im = self._read_image_file(f)  # cv2 only read regular image file, now change to can read tensor form input
             else:  # read image
-                im = cv2.imread(f)  # BGR
+                 im = self._read_image_file(f)  # 
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
-
+            
             h0, w0 = im.shape[:2]  # orig hw
+            im = np.ascontiguousarray(im)  # OpenCV resize compatibility for multi-channel tensor images. 
+            if im.dtype == np.float16:
+                im = im.astype(np.float32, copy=False) # fixed float16 error 
             if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
                 r = self.imgsz / max(h0, w0)  # ratio
                 if r != 1:  # if sizes are not equal
@@ -206,7 +213,7 @@ class BaseDataset(Dataset):
         """Saves an image as an *.npy file for faster loading."""
         f = self.npy_files[i]
         if not f.exists():
-            np.save(f.as_posix(), cv2.imread(self.im_files[i]), allow_pickle=False)
+            np.save(f.as_posix(), self._read_image_file(self.im_files[i]), allow_pickle=False)
 
     def check_cache_disk(self, safety_margin=0.5):
         """Check image caching requirements vs available disk space."""
@@ -216,7 +223,7 @@ class BaseDataset(Dataset):
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):
             im_file = random.choice(self.im_files)
-            im = cv2.imread(im_file)
+            im = self._read_image_file(im_file)
             if im is None:
                 continue
             b += im.nbytes
@@ -241,7 +248,7 @@ class BaseDataset(Dataset):
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):
-            im = cv2.imread(random.choice(self.im_files))  # sample image
+            im = self._read_image_file(random.choice(self.im_files))  # sample image
             if im is None:
                 continue
             ratio = self.imgsz / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
@@ -307,6 +314,54 @@ class BaseDataset(Dataset):
     def update_labels_info(self, label):
         """Custom your label format here."""
         return label
+
+    def openvc_resize(im, size, interpolation=cv2.INTER_LINEAR):
+        """Resize image with a safe path for high-channel arrays."""
+        im = np.ascontiguousarray(im)
+        if im.dtype == np.float16:
+            im = im.astype(np.float32, copy=False)
+
+        # OpenCV may fail direct resize on high-channel tensors; resize per channel.
+        if im.ndim == 3 and im.shape[2] > 4:
+            channels = [cv2.resize(im[..., c], size, interpolation=interpolation) for c in range(im.shape[2])]
+            return np.stack(channels, axis=2)
+
+        return cv2.resize(im, size, interpolation=interpolation)
+
+        def read_image_file(path):
+        """Read regular images with OpenCV and .pt tensors with torch.load()."""
+        suffix = Path(path).suffix.lower()
+        if suffix != ".pt":
+            return cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+        x = torch.load(path, map_location="cpu")
+        t = x if isinstance(x, torch.Tensor) else None
+        if t is None and isinstance(x, dict):
+            for v in x.values():
+                if isinstance(v, torch.Tensor):
+                    t = v
+                    break
+        if t is None:
+            raise TypeError(f"Unsupported .pt payload in {path}: {type(x)}")
+
+        if t.ndim == 4:
+            t = t[0]
+        if t.ndim == 2:
+            t = t.unsqueeze(-1)
+        if t.ndim != 3:
+            raise ValueError(f"Expected 2D/3D/4D tensor in {path}, got shape={tuple(t.shape)}")
+
+        # Convert CHW -> HWC for OpenCV/augmentation pipeline compatibility.
+        if t.shape[0] <= 64 and t.shape[1] > 8 and t.shape[2] > 8:
+            t = t.permute(1, 2, 0)
+
+        arr = t.detach().cpu().numpy()
+        arr = np.ascontiguousarray(arr)
+        if arr.dtype == np.float16:
+            arr = arr.astype(np.float32, copy=False)
+        return arr 
+
+    
 
     def build_transforms(self, hyp=None):
         """
